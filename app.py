@@ -8,10 +8,11 @@ from botocore.config import Config
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# 画面設定
 st.set_page_config(page_title="現場DXツール", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================
-# 🔒 シークレット情報
+# 🔒 シークレット情報 (Streamlit CloudのSecretsから読み込み)
 # ==========================================
 AWS_ACCESS_KEY = st.secrets["AWS_ACCESS_KEY"]
 AWS_SECRET_KEY = st.secrets["AWS_SECRET_KEY"]
@@ -20,6 +21,7 @@ DB_PASSWORD = st.secrets["DB_PASSWORD"]
 AWS_REGION = "ap-northeast-3"
 BUCKET_NAME = "koukan-images-sasaki-2026"
 
+# S3クライアント初期化
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -28,6 +30,7 @@ s3_client = boto3.client(
     config=Config(signature_version='s3v4')
 )
 
+# RDS設定
 DB_HOST = "koukan-database-1.c3gioua8mw4u.ap-northeast-3.rds.amazonaws.com"
 DB_PORT = "5432"
 DB_NAME = "postgres"
@@ -48,7 +51,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    # ベンダーマスタテーブル
+    # ベンダーマスタ
     c.execute('''
         CREATE TABLE IF NOT EXISTS vendors (
             id SERIAL PRIMARY KEY,
@@ -57,7 +60,7 @@ def init_db():
             password TEXT
         )
     ''')
-    # 日報テーブル（vendor_idで紐付け）
+    # 日報テーブル (vendor_idを使用)
     c.execute('''
         CREATE TABLE IF NOT EXISTS daily_reports (
             id SERIAL PRIMARY KEY,
@@ -68,7 +71,7 @@ def init_db():
             feedback TEXT DEFAULT ''
         )
     ''')
-    # エリア申請テーブル
+    # エリア申請テーブル (vendor_idを使用)
     c.execute('''
         CREATE TABLE IF NOT EXISTS area_requests (
             id SERIAL PRIMARY KEY,
@@ -85,9 +88,15 @@ def init_db():
 
 init_db()
 
-# ==========================================
-# 🔑 認証システム
-# ==========================================
+# ステータス更新用関数
+def update_status(table, record_id, new_status, feedback):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(f"UPDATE {table} SET status = %s, feedback = %s WHERE id = %s", (new_status, feedback, record_id))
+    conn.commit()
+    conn.close()
+
+# ログイン認証用関数
 def login_vendor(vendor_id, password):
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
@@ -97,14 +106,13 @@ def login_vendor(vendor_id, password):
     return user
 
 # ==========================================
-# 🌟 サイドバーメニュー
+# 🌟 メインメニュー
 # ==========================================
 st.sidebar.title("Buildee Clone")
 
 if "login_user" not in st.session_state:
     st.session_state.login_user = None
 
-# ログアウト処理
 if st.session_state.login_user:
     if st.sidebar.button("🚪 ログアウト"):
         st.session_state.login_user = None
@@ -113,7 +121,7 @@ if st.session_state.login_user:
 page = st.sidebar.radio("ワークスペースを選択", ["👷 現場用ツール（ベンダー）", "🏢 管理ダッシュボード（発注者）"])
 
 # ==========================================
-# 画面1：ベンダー向けツール（ログイン必須）
+# 画面1：ベンダー用ツール
 # ==========================================
 if page == "👷 現場用ツール（ベンダー）":
     if st.session_state.login_user is None:
@@ -136,34 +144,52 @@ if page == "👷 現場用ツール（ベンダー）":
     col_left, col_right = st.columns([1, 1.2])
 
     with col_left:
-        st.subheader("📝 本日の作業日報")
+        st.subheader("📝 本日の作業日報提出")
         with st.form("daily_report_form"):
             work_date = st.date_input("作業日", datetime.date.today())
             uploaded_file = st.file_uploader("完了写真をアップロード", type=["jpg", "png", "jpeg"])
             
             if st.form_submit_button("日報を提出する 🚀", use_container_width=True):
-                s3_file_name = ""
+                s_file_name = ""
                 if uploaded_file is not None:
-                    s3_file_name = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{uploaded_file.name}"
-                    s3_client.upload_fileobj(uploaded_file, BUCKET_NAME, s3_file_name, ExtraArgs={'ContentType': uploaded_file.type})
+                    s_file_name = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{uploaded_file.name}"
+                    s3_client.upload_fileobj(uploaded_file, BUCKET_NAME, s_file_name, ExtraArgs={'ContentType': uploaded_file.type})
                 
                 conn = get_db_connection()
                 c = conn.cursor()
-                c.execute("INSERT INTO daily_reports (vendor_id, work_date, image_path) VALUES (%s, %s, %s)", (user['vendor_id'], str(work_date), s3_file_name))
+                c.execute("INSERT INTO daily_reports (vendor_id, work_date, image_path) VALUES (%s, %s, %s)", (user['vendor_id'], str(work_date), s_file_name))
                 conn.commit()
                 conn.close()
-                st.success("日報を提出しました")
+                st.success("日報を提出しました！")
 
     with col_right:
-        st.subheader("📬 フィードバック")
-        conn = get_db_connection()
-        df_my = pd.read_sql_query("SELECT * FROM daily_reports WHERE vendor_id = %s ORDER BY id DESC LIMIT 5", conn, params=(user['vendor_id'],))
-        conn.close()
-        for idx, row in df_my.iterrows():
-            st.info(f"【{row['status']}】 {row['work_date']} 日報")
+        st.subheader("🗺️ 次週のエリア申請")
+        with st.form("area_form"):
+            t_floor = st.radio("フロア", ["1F", "2F", "3F", "4F", "5F"], horizontal=True)
+            # エリア選択 (簡略化表示)
+            sel_grids = st.multiselect("作業エリア選択", [f"{c}-{r}" for r in ['1','2','3','4','5'] for c in ['A','B','C','D','E']])
+            if st.form_submit_button("エリア申請を提出 🚀"):
+                if sel_grids:
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    c.execute("INSERT INTO area_requests (vendor_id, target_floor, selected_grids) VALUES (%s, %s, %s)", (user['vendor_id'], t_floor, ",".join(sel_grids)))
+                    conn.commit()
+                    conn.close()
+                    st.success("エリア申請を完了しました")
+                else:
+                    st.error("エリアを選択してください")
+
+    st.divider()
+    st.subheader("🔔 自社の提出・承認状況")
+    conn = get_db_connection()
+    df_status = pd.read_sql_query("SELECT * FROM daily_reports WHERE vendor_id = %s ORDER BY id DESC LIMIT 5", conn, params=(user['vendor_id'],))
+    conn.close()
+    if not df_status.empty:
+        for _, r in df_status.iterrows():
+            st.write(f"【{r['status']}】 {r['work_date']} 提出分 (フィードバック: {r['feedback']})")
 
 # ==========================================
-# 画面2：管理ダッシュボード
+# 画面2：発注者用ダッシュボード
 # ==========================================
 elif page == "🏢 管理ダッシュボード（発注者）":
     st.title("HQ ダッシュボード")
@@ -171,34 +197,71 @@ elif page == "🏢 管理ダッシュボード（発注者）":
         st.warning("セキュリティキーを入力してください")
         st.stop()
 
-    # --- 🌟 新機能：ベンダー管理タブ ---
-    tab1, tab2, tab3 = st.tabs(["📋 承認待ち", "🚨 バッティング監視", "👥 ベンダー管理"])
+    tab1, tab2, tab3 = st.tabs(["📋 承認待ち日報", "🚨 バッティング監視", "👥 ベンダー管理"])
+
+    with tab1:
+        st.subheader("📋 承認待ちリスト")
+        conn = get_db_connection()
+        # JOINを使用して会社名を取得
+        query = """
+            SELECT dr.*, v.vendor_name 
+            FROM daily_reports dr
+            LEFT JOIN vendors v ON dr.vendor_id = v.vendor_id
+            WHERE dr.status = '未確認' OR dr.status = '差し戻し'
+            ORDER BY dr.id DESC
+        """
+        df_p = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        if df_p.empty:
+            st.success("未確認の日報はありません")
+        else:
+            for _, r in df_p.iterrows():
+                with st.expander(f"確認待ち: {r['work_date']} | {r['vendor_name'] or '不明'}"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if r['image_path']:
+                            try:
+                                res = s3_client.get_object(Bucket=BUCKET_NAME, Key=r['image_path'])
+                                st.image(res['Body'].read(), use_container_width=True)
+                            except: st.write("画像読み込み失敗")
+                    with c2:
+                        fb = st.text_area("コメント", key=f"f_{r['id']}")
+                        if st.button("✅ 承認", key=f"a_{r['id']}"):
+                            update_status('daily_reports', r['id'], '承認済', fb)
+                            st.rerun()
+                        if st.button("❌ 差戻", key=f"r_{r['id']}"):
+                            update_status('daily_reports', r['id'], '差し戻し', fb)
+                            st.rerun()
+
+    with tab2:
+        st.subheader("🚨 リアルタイム監視")
+        conn = get_db_connection()
+        # こちらもJOINして会社名を取得
+        df_a = pd.read_sql_query("SELECT ar.*, v.vendor_name FROM area_requests ar LEFT JOIN vendors v ON ar.vendor_id = v.vendor_id", conn)
+        conn.close()
+        # (以前のグリッド表示ロジックをここに配置)
+        st.write("※バッティング状況は、各エリア申請データを元に集計されます。")
+        st.dataframe(df_a)
 
     with tab3:
-        st.subheader("ベンダーアカウントの発行")
-        with st.form("add_vendor_form"):
-            new_v_name = st.text_input("会社名 (例: A設備工業)")
-            new_v_id = st.text_input("ログインID (例: vendorA)")
-            new_v_pw = st.text_input("パスワード")
+        st.subheader("👥 ベンダーアカウント管理")
+        with st.form("v_reg"):
+            nv_name = st.text_input("会社名")
+            nv_id = st.text_input("ログインID")
+            nv_pw = st.text_input("パスワード")
             if st.form_submit_button("新規登録"):
                 conn = get_db_connection()
                 c = conn.cursor()
                 try:
-                    c.execute("INSERT INTO vendors (vendor_id, vendor_name, password) VALUES (%s, %s, %s)", (new_v_id, new_v_name, new_v_pw))
+                    c.execute("INSERT INTO vendors (vendor_id, vendor_name, password) VALUES (%s, %s, %s)", (nv_id, nv_name, nv_pw))
                     conn.commit()
-                    st.success(f"{new_v_name} を登録しました")
-                except:
-                    st.error("そのIDは既に使われています")
+                    st.success(f"{nv_name} を登録しました")
+                except: st.error("登録エラー（ID重複の可能性）")
                 conn.close()
-
+        
         st.divider()
-        st.subheader("登録済みベンダー一覧")
         conn = get_db_connection()
-        df_v = pd.read_sql_query("SELECT id, vendor_id, vendor_name, password FROM vendors", conn)
+        df_v = pd.read_sql_query("SELECT vendor_id, vendor_name, password FROM vendors", conn)
         conn.close()
         st.dataframe(df_v, use_container_width=True)
-
-    # (タブ1, タブ2 の中身は以前の承認・監視ロジックを配置)
-    with tab1:
-        # ...（承認待ちロジックをここに配置）
-        pass
