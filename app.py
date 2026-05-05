@@ -48,12 +48,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    # 🌟 一時的に追加：古いテーブルを一度削除してリセットする
-    c.execute("DROP TABLE IF EXISTS daily_reports")
-    c.execute("DROP TABLE IF EXISTS area_requests")
-    c.execute("DROP TABLE IF EXISTS vendors")
-    
-    # 以下、新しい構造で作成（変更なし）
+    # ベンダーマスタテーブル
     c.execute('''
         CREATE TABLE IF NOT EXISTS vendors (
             id SERIAL PRIMARY KEY,
@@ -62,6 +57,7 @@ def init_db():
             password TEXT
         )
     ''')
+    # 日報テーブル（vendor_idで紐付け）
     c.execute('''
         CREATE TABLE IF NOT EXISTS daily_reports (
             id SERIAL PRIMARY KEY,
@@ -72,6 +68,7 @@ def init_db():
             feedback TEXT DEFAULT ''
         )
     ''')
+    # エリア申請テーブル
     c.execute('''
         CREATE TABLE IF NOT EXISTS area_requests (
             id SERIAL PRIMARY KEY,
